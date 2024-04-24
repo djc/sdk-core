@@ -46,7 +46,6 @@ use crate::{
         metrics::MetricsContext, remove_trace_subscriber_for_current_thread,
         set_trace_subscriber_for_current_thread, telemetry_init, TelemetryInstance,
     },
-    worker::client::WorkerClientBag,
 };
 use futures::Stream;
 use std::sync::Arc;
@@ -57,47 +56,6 @@ use temporal_sdk_core_api::{
     Worker as WorkerTrait,
 };
 use temporal_sdk_core_protos::coresdk::ActivityHeartbeat;
-
-/// Initialize a worker bound to a task queue.
-///
-/// You will need to have already initialized a [CoreRuntime] which will be used for this worker.
-/// After the worker is initialized, you should use [CoreRuntime::tokio_handle] to run the worker's
-/// async functions.
-///
-/// Lang implementations may pass in a [ConfiguredClient] directly (or a
-/// [RetryClient] wrapping one, or a handful of other variants of the same idea). When they do so,
-/// this function will always overwrite the client retry configuration, force the client to use the
-/// namespace defined in the worker config, and set the client identity appropriately. IE: Use
-/// [ClientOptions::connect_no_namespace], not [ClientOptions::connect].
-pub fn init_worker<CT>(
-    runtime: &CoreRuntime,
-    worker_config: WorkerConfig,
-    client: CT,
-) -> Result<Worker, anyhow::Error>
-where
-    CT: Into<sealed::AnyClient>,
-{
-    let client = init_worker_client(&worker_config, *client.into().into_inner());
-    if client.namespace() != worker_config.namespace {
-        panic!("Passed in client is not bound to the same namespace as the worker");
-    }
-    let client_ident = client.get_options().identity.clone();
-    let sticky_q = sticky_q_name_for_worker(&client_ident, &worker_config);
-    let client_bag = Arc::new(WorkerClientBag::new(
-        client,
-        worker_config.namespace.clone(),
-        client_ident,
-        worker_config.worker_build_id.clone(),
-        worker_config.use_worker_versioning,
-    ));
-
-    Ok(Worker::new(
-        worker_config,
-        sticky_q,
-        client_bag,
-        Some(&runtime.telemetry),
-    ))
-}
 
 /// Create a worker for replaying one or more existing histories. It will auto-shutdown as soon as
 /// all histories have finished being replayed.
@@ -114,34 +72,6 @@ where
         "Registering replay worker"
     );
     rwi.into_core_worker()
-}
-
-pub(crate) fn init_worker_client(
-    config: &WorkerConfig,
-    client: ConfiguredClient<TemporalServiceClientWithMetrics>,
-) -> RetryClient<Client> {
-    let mut client = Client::new(client, config.namespace.clone());
-    if let Some(ref id_override) = config.client_identity_override {
-        client.options_mut().identity = id_override.clone();
-    }
-    RetryClient::new(client, RetryConfig::default())
-}
-
-/// Creates a unique sticky queue name for a worker, iff the config allows for 1 or more cached
-/// workflows.
-pub(crate) fn sticky_q_name_for_worker(
-    process_identity: &str,
-    config: &WorkerConfig,
-) -> Option<String> {
-    if config.max_cached_workflows > 0 {
-        Some(format!(
-            "{}-{}",
-            &process_identity,
-            uuid::Uuid::new_v4().simple()
-        ))
-    } else {
-        None
-    }
 }
 
 mod sealed {

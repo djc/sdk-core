@@ -4,12 +4,11 @@ use crate::{
     pollers::{BoxedPoller, MockManualPoller, MockPoller},
     protosext::ValidPollWFTQResponse,
     replay::TestHistoryBuilder,
-    sticky_q_name_for_worker,
     worker::{
         client::{
             mocks::mock_workflow_client, MockWorkerClient, WorkerClient, WorkflowTaskCompletion,
         },
-        TaskPollers,
+        sticky_q_name_for_worker, TaskPollers,
     },
     TaskToken, Worker, WorkerConfig, WorkerConfigBuilder,
 };

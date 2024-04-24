@@ -1,5 +1,6 @@
 mod activities;
 pub(crate) mod client;
+use client::WorkerClientBag;
 mod slot_provider;
 mod workflow;
 
@@ -11,7 +12,10 @@ pub(crate) use activities::{
 };
 pub(crate) use workflow::{wft_poller::new_wft_poller, LEGACY_QUERY_ID};
 
-use temporal_client::{ConfiguredClient, TemporalServiceClientWithMetrics, WorkerKey};
+use temporal_client::{
+    Client, ConfiguredClient, RetryClient, RetryConfig, TemporalServiceClientWithMetrics,
+    WorkerKey, WorkflowClientTrait,
+};
 
 use crate::{
     abstractions::{dbg_panic, MeteredSemaphore},
@@ -20,6 +24,7 @@ use crate::{
         new_activity_task_buffer, new_workflow_task_buffer, BoxedActPoller, WorkflowTaskPoller,
     },
     protosext::validate_activity_completion,
+    sealed,
     telemetry::{
         metrics::{
             activity_poller, activity_worker_type, local_activity_worker_type, workflow_poller,
@@ -32,7 +37,8 @@ use crate::{
         client::WorkerClient,
         workflow::{LAReqSink, LocalResolution, WorkflowBasics, Workflows},
     },
-    ActivityHeartbeat, CompleteActivityError, PollActivityError, PollWfError, WorkerTrait,
+    ActivityHeartbeat, CompleteActivityError, CoreRuntime, PollActivityError, PollWfError,
+    WorkerTrait,
 };
 use activities::WorkerActivityTasks;
 use futures_util::{stream, StreamExt};
@@ -199,7 +205,45 @@ impl WorkerTrait for Worker {
 }
 
 impl Worker {
-    pub(crate) fn new(
+    /// Initialize a worker bound to a task queue.
+    ///
+    /// You will need to have already initialized a [CoreRuntime] which will be used for this worker.
+    /// After the worker is initialized, you should use [CoreRuntime::tokio_handle] to run the worker's
+    /// async functions.
+    ///
+    /// Lang implementations may pass in a [ConfiguredClient] directly (or a
+    /// [RetryClient] wrapping one, or a handful of other variants of the same idea). When they do so,
+    /// this function will always overwrite the client retry configuration, force the client to use the
+    /// namespace defined in the worker config, and set the client identity appropriately. IE: Use
+    /// [ClientOptions::connect_no_namespace], not [ClientOptions::connect].
+    pub fn new(
+        runtime: &CoreRuntime,
+        worker_config: WorkerConfig,
+        client: impl Into<sealed::AnyClient>,
+    ) -> Result<Self, anyhow::Error> {
+        let client = init_worker_client(&worker_config, *client.into().into_inner());
+        if client.namespace() != worker_config.namespace {
+            panic!("Passed in client is not bound to the same namespace as the worker");
+        }
+        let client_ident = client.get_options().identity.clone();
+        let sticky_q = sticky_q_name_for_worker(&client_ident, &worker_config);
+        let client_bag = Arc::new(WorkerClientBag::new(
+            client,
+            worker_config.namespace.clone(),
+            client_ident,
+            worker_config.worker_build_id.clone(),
+            worker_config.use_worker_versioning,
+        ));
+
+        Ok(Self::new_internal(
+            worker_config,
+            sticky_q,
+            client_bag,
+            Some(&runtime.telemetry),
+        ))
+    }
+
+    pub(crate) fn new_internal(
         config: WorkerConfig,
         sticky_queue_name: Option<String>,
         client: Arc<dyn WorkerClient>,
@@ -223,14 +267,14 @@ impl Worker {
         let mut worker_key = self.worker_key.lock();
         let slot_provider = (*worker_key).and_then(|k| self.wf_client.workers().unregister(k));
         self.wf_client
-            .replace_client(super::init_worker_client(&self.config, new_client));
+            .replace_client(init_worker_client(&self.config, new_client));
         *worker_key = slot_provider
             .and_then(|slot_provider| self.wf_client.workers().register(slot_provider));
     }
 
     #[cfg(test)]
     pub(crate) fn new_test(config: WorkerConfig, client: impl WorkerClient + 'static) -> Self {
-        Self::new(config, None, Arc::new(client), None)
+        Self::new_internal(config, None, Arc::new(client), None)
     }
 
     #[allow(clippy::too_many_arguments)] // Not much worth combining here
@@ -667,6 +711,34 @@ impl Worker {
 
     fn notify_local_result(&self, run_id: &str, res: LocalResolution) {
         self.workflows.notify_of_local_result(run_id, res);
+    }
+}
+
+pub(crate) fn init_worker_client(
+    config: &WorkerConfig,
+    client: ConfiguredClient<TemporalServiceClientWithMetrics>,
+) -> RetryClient<Client> {
+    let mut client = Client::new(client, config.namespace.clone());
+    if let Some(ref id_override) = config.client_identity_override {
+        client.options_mut().identity = id_override.clone();
+    }
+    RetryClient::new(client, RetryConfig::default())
+}
+
+/// Creates a unique sticky queue name for a worker, iff the config allows for 1 or more cached
+/// workflows.
+pub(crate) fn sticky_q_name_for_worker(
+    process_identity: &str,
+    config: &WorkerConfig,
+) -> Option<String> {
+    if config.max_cached_workflows > 0 {
+        Some(format!(
+            "{}-{}",
+            &process_identity,
+            uuid::Uuid::new_v4().simple()
+        ))
+    } else {
+        None
     }
 }
 

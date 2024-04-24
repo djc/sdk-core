@@ -32,7 +32,7 @@ use temporal_sdk::{
 #[cfg(feature = "ephemeral-server")]
 use temporal_sdk_core::ephemeral_server::{EphemeralExe, EphemeralExeVersion};
 use temporal_sdk_core::{
-    init_replay_worker, init_worker,
+    init_replay_worker,
     replay::ReplayWorkerInput,
     telemetry::{build_otlp_metric_exporter, start_prometheus_metric_exporter},
     ClientOptions, ClientOptionsBuilder, CoreRuntime, WorkerConfigBuilder,
@@ -375,7 +375,8 @@ impl CoreWfStarter {
                 } else {
                     INTEG_TESTS_RT.get().unwrap()
                 };
-                let worker = init_worker(rt, cfg, client.clone()).expect("Worker inits cleanly");
+                let worker = temporal_sdk_core::Worker::new(rt, cfg, client.clone())
+                    .expect("Worker inits cleanly");
                 InitializedWorker {
                     worker: Arc::new(worker),
                     client,
